@@ -1,0 +1,236 @@
+# AppForShare Android store build (reusable workflow). Source of the public repository appforshare/store-build.
+#
+# An app author calls this from a short job in their own repository (see README.md). The build steps live here, so
+# the author cannot change them; AppForShare only accepts an upload whose GitHub OIDC token says it came from this
+# file at an allowed version tag, on a GitHub hosted runner, for the repository and commit of the store listing.
+#
+# Two jobs on purpose:
+#   build    runs the app's own Gradle build with read only repository access and no OIDC token, so nothing in the
+#            app's build scripts can mint a token or sign an attestation.
+#   publish  takes the APK from the build job, records a Sigstore signed build provenance (public repositories), asks
+#            GitHub for an OIDC token with the AppForShare audience and uploads APK + provenance to AppForShare.
+#
+# Every action is pinned by commit SHA. Bump them only in a new version tag (v1.x.y), never by moving a SHA in place.
+
+name: AppForShare store build
+
+on:
+  workflow_call:
+    inputs:
+      listing:
+        description: Store listing id, shown in the Store tab of the project on AppForShare.
+        type: string
+        required: true
+      package:
+        description: Android application id of the app, for example com.example.app.
+        type: string
+        required: true
+      module:
+        description: Gradle module of the app (app, or a path such as apps:android).
+        type: string
+        required: false
+        default: app
+      flavor:
+        description: Product flavor, empty when the app has no flavors.
+        type: string
+        required: false
+        default: ''
+      build-type:
+        description: Gradle build type.
+        type: string
+        required: false
+        default: release
+      java:
+        description: JDK major version, 17 or 21.
+        type: string
+        required: false
+        default: '17'
+      staging:
+        description: AppForShare staff testing only. Sends the build to the AppForShare staging server instead.
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      sha256:
+        description: SHA-256 of the unsigned APK that was sent to AppForShare.
+        value: ${{ jobs.publish.outputs.sha256 }}
+
+permissions: {}
+
+env:
+  # Pinned toolchain. Changing any of these is a new version of this workflow.
+  JDK_17: '17.0.21'
+  JDK_21: '21.0.13'
+  ANDROID_CMDLINE_TOOLS: '15859902'
+  AFS_INGEST_URL: ${{ inputs.staging && 'https://v2.appforshare.io' || 'https://appforshare.io' }}/api/android-store/builds/ingest
+  AFS_AUDIENCE: https://appforshare.io/android-store
+
+jobs:
+  build:
+    name: Build unsigned APK
+    # GitHub hosted only: a fresh virtual machine per job. Self hosted runners are refused by AppForShare.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      apk-name: ${{ steps.find.outputs.name }}
+    steps:
+      - name: Check inputs
+        id: inputs
+        env:
+          IN_LISTING: ${{ inputs.listing }}
+          IN_PACKAGE: ${{ inputs.package }}
+          IN_MODULE: ${{ inputs.module }}
+          IN_FLAVOR: ${{ inputs.flavor }}
+          IN_BUILD_TYPE: ${{ inputs.build-type }}
+          IN_JAVA: ${{ inputs.java }}
+        run: |
+          set -euo pipefail
+          [[ "$IN_LISTING" =~ ^[0-9]{1,9}$ ]] || { echo "::error::listing must be the number from the Store tab"; exit 1; }
+          [[ "$IN_PACKAGE" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] || { echo "::error::package is not an Android application id"; exit 1; }
+          [[ "$IN_MODULE" =~ ^:?[A-Za-z0-9_-]+(:[A-Za-z0-9_-]+)*$ ]] || { echo "::error::module must look like app or apps:android"; exit 1; }
+          [[ -z "$IN_FLAVOR" || "$IN_FLAVOR" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] || { echo "::error::flavor must be letters and digits"; exit 1; }
+          [[ "$IN_BUILD_TYPE" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] || { echo "::error::build-type must be letters and digits"; exit 1; }
+          case "$IN_JAVA" in
+            17) echo "jdk=$JDK_17" >> "$GITHUB_OUTPUT" ;;
+            21) echo "jdk=$JDK_21" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::java must be 17 or 21"; exit 1 ;;
+          esac
+          module="${IN_MODULE#:}"
+          cap() { printf '%s%s' "$(printf '%s' "${1:0:1}" | tr '[:lower:]' '[:upper:]')" "${1:1}"; }
+          variant="$(cap "$IN_FLAVOR")$(cap "$IN_BUILD_TYPE")"
+          echo "task=:${module}:assemble${variant}" >> "$GITHUB_OUTPUT"
+          echo "dir=${module//://}/build/outputs/apk" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Verify the Gradle wrapper against Gradle's published checksums
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          min-wrapper-count: 1
+          allow-snapshots: false
+
+      - name: Check the Gradle distribution address
+        run: |
+          set -euo pipefail
+          props=gradle/wrapper/gradle-wrapper.properties
+          [[ -f gradlew && -f "$props" ]] || { echo "::error::The repository needs gradlew and $props at its root."; exit 1; }
+          url="$(grep -E '^distributionUrl=' "$props" | cut -d= -f2- | sed 's/\\:/:/g')"
+          [[ "$url" =~ ^https://services\.gradle\.org/distributions/gradle-[0-9.]+(-rc-[0-9]+)?-(bin|all)\.zip$ ]] || { echo "::error::distributionUrl must point to https://services.gradle.org/distributions/ (found: $url)"; exit 1; }
+          echo "Gradle distribution: $url"
+
+      - name: Set up JDK (Temurin, pinned)
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ steps.inputs.outputs.jdk }}
+
+      - name: Set up the Android SDK (pinned command line tools)
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          cmdline-tools-version: ${{ env.ANDROID_CMDLINE_TOOLS }}
+          packages: platform-tools
+
+      - name: Build
+        env:
+          TASK: ${{ steps.inputs.outputs.task }}
+        run: |
+          set -euo pipefail
+          java -version
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-build-cache --stacktrace "$TASK"
+
+      - name: Find the APK
+        id: find
+        env:
+          DIR: ${{ steps.inputs.outputs.dir }}
+          IN_FLAVOR: ${{ inputs.flavor }}
+          IN_BUILD_TYPE: ${{ inputs.build-type }}
+        run: |
+          set -euo pipefail
+          out="$DIR/${IN_FLAVOR:+$IN_FLAVOR/}$IN_BUILD_TYPE"
+          mapfile -t apks < <(find "$out" -maxdepth 1 -type f -name '*.apk' | sort)
+          if [[ ${#apks[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one APK in $out, found ${#apks[@]}. Turn off ABI splits for this build type (one universal APK)."
+            exit 1
+          fi
+          mkdir -p afs-out
+          cp "${apks[0]}" afs-out/app-unsigned.apk
+          echo "name=$(basename "${apks[0]}")" >> "$GITHUB_OUTPUT"
+          sha256sum afs-out/app-unsigned.apk
+
+      - name: Hand the APK to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: afs-store-apk
+          path: afs-out/app-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Attest and send to AppForShare
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - name: Get the APK from the build job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: afs-store-apk
+          path: afs-out
+
+      - name: Digest
+        id: digest
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum afs-out/app-unsigned.apk | cut -d' ' -f1)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "APK SHA-256: $sha"
+
+      # Artifact attestations on private repositories need GitHub Enterprise Cloud, so they are made for public
+      # repositories only. AppForShare requires them for public repositories.
+      - name: Build provenance (Sigstore)
+        id: attest
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: afs-out/app-unsigned.apk
+          show-summary: true
+
+      - name: Send to AppForShare
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          IN_LISTING: ${{ inputs.listing }}
+          IN_PACKAGE: ${{ inputs.package }}
+          IN_MODULE: ${{ inputs.module }}
+          IN_FLAVOR: ${{ inputs.flavor }}
+          IN_BUILD_TYPE: ${{ inputs.build-type }}
+        run: |
+          set -euo pipefail
+          token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AFS_AUDIENCE" | jq -r .value)"
+          [[ -n "$token" && "$token" != null ]] || { echo "::error::GitHub did not give an OIDC token. The calling job needs permissions: id-token: write."; exit 1; }
+          echo "::add-mask::$token"
+          args=(-sS --retry 3 --retry-all-errors --max-time 900 -o afs-response.json -w '%{http_code}'
+            -H "Authorization: Bearer $token"
+            -F "listing=$IN_LISTING" -F "package=$IN_PACKAGE" -F "module=$IN_MODULE"
+            -F "flavor=$IN_FLAVOR" -F "buildType=$IN_BUILD_TYPE"
+            -F "apk=@afs-out/app-unsigned.apk;type=application/vnd.android.package-archive")
+          if [[ -n "${BUNDLE:-}" ]]; then args+=(-F "bundle=@$BUNDLE;type=application/json"); fi
+          code="$(curl "${args[@]}" "$AFS_INGEST_URL")"
+          message="$(jq -r '.message // .error // "no answer"' afs-response.json 2>/dev/null || echo 'no answer')"
+          echo "AppForShare answered $code: $message"
+          echo "### AppForShare store: $message" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$code" == 2* ]] || { echo "::error::$message"; exit 1; }
